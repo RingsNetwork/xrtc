@@ -1,0 +1,25 @@
+[package]
+name = "xrtc"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+axum = "0.6.19"
+backtrace = "0.3.68"
+bincode = "1.3.3"
+bytes = { version = "1.4.0", features = ["serde"] }
+clap = { version = "4.3.19", features = ["derive"] }
+dashmap = "5.5.0"
+futures = "0.3.28"
+reqwest = { version = "0.11.18", features = ["json", "rustls-tls"] }
+serde = { version = "1.0.178", features = ["derive"] }
+serde_json = "1.0.104"
+thiserror = "1.0.44"
+tokio = { version = "1.29.1", features = ["full"] }
+tracing = "0.1.37"
+tracing-log = "0.1.3"
+tracing-subscriber = { version = "0.3.17", features = ["env-filter"] }
+uuid = { version = "1.4.1", features = ["v4", "serde"] }
+webrtc = "0.8.0"
