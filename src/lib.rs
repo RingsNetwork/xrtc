@@ -13,7 +13,6 @@ use serde::Deserialize;
 use serde::Serialize;
 use tokio::sync::mpsc;
 use tokio::sync::Mutex;
-use uuid::Uuid;
 use webrtc::data_channel::data_channel_message::DataChannelMessage;
 use webrtc::data_channel::RTCDataChannel;
 use webrtc::ice_transport::ice_server::RTCIceServer;
@@ -22,16 +21,17 @@ use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
 use webrtc::peer_connection::RTCPeerConnection;
 
 use crate::error::Result;
+use crate::proxy::Tunnel;
+use crate::proxy::TunnelDefeat;
+use crate::proxy::TunnelId;
 
-type ConnectionId = String;
-type TransactionId = Uuid;
+pub type ConnectionId = String;
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
 pub enum XrtcMessage {
-    TcpDial { tx: TransactionId, addr: SocketAddr },
-    TcpClose { tx: TransactionId },
-    TcpInboundPackage { tx: TransactionId, body: Bytes },
-    TcpOutboundPackage { tx: TransactionId, body: Bytes },
+    TcpDial { tid: TunnelId, addr: SocketAddr },
+    TcpClose { tid: TunnelId, reason: TunnelDefeat },
+    TcpPackage { tid: TunnelId, body: Bytes },
 }
 
 pub struct XrtcServer {
@@ -40,12 +40,12 @@ pub struct XrtcServer {
     pub data_channel_message_tx: mpsc::Sender<(ConnectionId, XrtcMessage)>,
     pub data_channel_message_rx: Mutex<mpsc::Receiver<(ConnectionId, XrtcMessage)>>,
     pub connections: DashMap<ConnectionId, Arc<XrtcConnection>>,
-    pub transactions: DashMap<TransactionId, Arc<XrtcConnection>>,
 }
 
 pub struct XrtcConnection {
     webrtc_conn: RTCPeerConnection,
     webrtc_data_channel: Arc<RTCDataChannel>,
+    tunnels: DashMap<TunnelId, Tunnel>,
 }
 
 impl XrtcServer {
@@ -68,16 +68,75 @@ impl XrtcServer {
             data_channel_message_tx,
             data_channel_message_rx,
             connections: DashMap::new(),
-            transactions: DashMap::new(),
         }
     }
 
     pub async fn run(&self) {
+        tokio::join!(
+            self.listen_webrtc_connections(),
+            self.listen_tcp_connections()
+        );
+    }
+
+    pub async fn listen_webrtc_connections(&self) {
         let mut data_channel_message_rx = self.data_channel_message_rx.lock().await;
 
         loop {
             if let Some((cid, msg)) = data_channel_message_rx.recv().await {
-                tracing::debug!("Received XrtcMessage from {cid}: {msg:?}");
+                if let Err(e) = self.handle_message(cid, msg).await {
+                    tracing::error!("Error handling message: {e}");
+                }
+            }
+        }
+    }
+
+    pub async fn listen_tcp_connections(&self) {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        }
+    }
+
+    pub async fn handle_message(&self, cid: ConnectionId, msg: XrtcMessage) -> Result<()> {
+        match msg {
+            XrtcMessage::TcpDial { tid, addr } => {
+                let conn = self
+                    .connections
+                    .get(&cid)
+                    .ok_or(Error::ConnectionNotFound)?;
+
+                let mut tunnel = Tunnel::new(tid);
+                tunnel.listen(addr, conn.clone()).await;
+
+                conn.tunnels.insert(tid, tunnel);
+                Ok(())
+            }
+
+            XrtcMessage::TcpClose {
+                tid,
+                reason: _reason,
+            } => {
+                let conn = self
+                    .connections
+                    .get(&cid)
+                    .ok_or(Error::ConnectionNotFound)?;
+
+                conn.tunnels.remove(&tid);
+                Ok(())
+            }
+
+            XrtcMessage::TcpPackage { tid, body } => {
+                let conn = self
+                    .connections
+                    .get(&cid)
+                    .ok_or(Error::ConnectionNotFound)?;
+
+                conn.tunnels
+                    .get(&tid)
+                    .ok_or(Error::TunnelNotFound)?
+                    .send(body)
+                    .await;
+
+                Ok(())
             }
         }
     }
@@ -127,6 +186,7 @@ impl XrtcServer {
         let xrtc_conn = XrtcConnection {
             webrtc_conn,
             webrtc_data_channel,
+            tunnels: DashMap::new(),
         };
 
         self.connections.insert(cid, Arc::new(xrtc_conn));
@@ -135,24 +195,11 @@ impl XrtcServer {
     }
 
     pub async fn send_message(&self, cid: ConnectionId, msg: XrtcMessage) -> Result<()> {
-        let conn = self
-            .connections
+        self.connections
             .get(&cid)
-            .ok_or(Error::ConnectionNotFound)?;
-
-        let data = bincode::serialize(&msg).map(Bytes::from)?;
-        conn.webrtc_data_channel.send(&data).await?;
-
-        Ok(())
-    }
-
-    // Proxy communication
-    pub async fn dial(&self, cid: ConnectionId, addr: SocketAddr) -> Result<()> {
-        let message = XrtcMessage::TcpDial {
-            tx: Uuid::new_v4(),
-            addr,
-        };
-        self.send_message(cid, message).await
+            .ok_or(Error::ConnectionNotFound)?
+            .send_message(msg)
+            .await
     }
 }
 
@@ -202,5 +249,11 @@ impl XrtcConnection {
             .set_remote_description(answer)
             .await
             .map_err(|e| e.into())
+    }
+
+    async fn send_message(&self, msg: XrtcMessage) -> Result<()> {
+        let data = bincode::serialize(&msg).map(Bytes::from)?;
+        self.webrtc_data_channel.send(&data).await?;
+        Ok(())
     }
 }
