@@ -82,49 +82,30 @@ impl Tunnel {
         }
     }
 
-    pub async fn listen(&mut self, addr: SocketAddr, connection: Arc<XrtcConnection>) {
+    pub async fn listen(&mut self, local_stream: TcpStream, connection: Arc<XrtcConnection>) {
         if self.listener.is_some() {
             return;
         }
 
-        match TunnelListener::new(self.tid, addr, connection.clone()).await {
-            Err(defeat) => {
-                let message = XrtcMessage::TcpClose {
-                    tid: self.tid,
-                    reason: defeat,
-                };
+        let mut listener = TunnelListener::new(self.tid, local_stream, connection.clone()).await;
+        let remote_stream_tx = listener.remote_stream_tx.clone();
+        let listener_handler = tokio::spawn(Box::pin(async move { listener.listen().await }));
 
-                if let Err(e) = connection.send_message(message).await {
-                    tracing::error!("Tunnel {} send tcp close message failed: {e}", self.tid)
-                }
-            }
-            Ok(mut listener) => {
-                let remote_stream_tx = listener.remote_stream_tx.clone();
-                let listener_handler =
-                    tokio::spawn(Box::pin(async move { listener.listen().await }));
-
-                self.remote_stream_tx = Some(remote_stream_tx);
-                self.listener = Some(listener_handler);
-            }
-        }
+        self.remote_stream_tx = Some(remote_stream_tx);
+        self.listener = Some(listener_handler);
     }
 }
 
 impl TunnelListener {
-    async fn new(
-        tid: TunnelId,
-        addr: SocketAddr,
-        connection: Arc<XrtcConnection>,
-    ) -> Result<Self, TunnelDefeat> {
-        let local_stream = tcp_connect_with_timeout(addr, 10).await?;
+    async fn new(tid: TunnelId, local_stream: TcpStream, connection: Arc<XrtcConnection>) -> Self {
         let (remote_stream_tx, remote_stream_rx) = mpsc::channel(1024);
-        Ok(Self {
+        Self {
             tid,
             local_stream,
             remote_stream_tx,
             remote_stream_rx,
             connection,
-        })
+        }
     }
 
     async fn listen(&mut self) {
@@ -134,7 +115,7 @@ impl TunnelListener {
             let mut defeat = TunnelDefeat::None;
 
             loop {
-                let mut buf = [0u8; 1024];
+                let mut buf = [0u8; 30000];
 
                 match local_read.read(&mut buf).await {
                     Err(e) => {
@@ -203,7 +184,7 @@ impl TunnelListener {
     }
 }
 
-async fn tcp_connect_with_timeout(
+pub async fn tcp_connect_with_timeout(
     addr: SocketAddr,
     request_timeout_s: u64,
 ) -> Result<TcpStream, TunnelDefeat> {

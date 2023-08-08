@@ -1,3 +1,5 @@
+use crate::proxy::TunnelDefeat;
+
 pub type Result<T> = std::result::Result<T, Error>;
 
 #[derive(thiserror::Error, Debug)]
@@ -19,4 +21,7 @@ pub enum Error {
 
     #[error("Connection not found")]
     TunnelNotFound,
+
+    #[error("Tunnel error: {0:?}")]
+    TunnelError(TunnelDefeat),
 }

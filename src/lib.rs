@@ -9,8 +9,10 @@ use std::sync::Arc;
 use bytes::Bytes;
 use dashmap::DashMap;
 use error::Error;
+use proxy::tcp_connect_with_timeout;
 use serde::Deserialize;
 use serde::Serialize;
+use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio::sync::Mutex;
 use webrtc::data_channel::data_channel_message::DataChannelMessage;
@@ -83,6 +85,7 @@ impl XrtcServer {
 
         loop {
             if let Some((cid, msg)) = data_channel_message_rx.recv().await {
+                tracing::info!("Received message from {cid}: {msg:?}");
                 if let Err(e) = self.handle_message(cid, msg).await {
                     tracing::error!("Error handling message: {e}");
                 }
@@ -104,11 +107,25 @@ impl XrtcServer {
                     .get(&cid)
                     .ok_or(Error::ConnectionNotFound)?;
 
-                let mut tunnel = Tunnel::new(tid);
-                tunnel.listen(addr, conn.clone()).await;
+                match tcp_connect_with_timeout(addr, 10).await {
+                    Err(e) => {
+                        if let Err(e) = conn
+                            .send_message(XrtcMessage::TcpClose { tid, reason: e })
+                            .await
+                        {
+                            tracing::error!("Tunnel {tid} send tcp close message failed: {e}")
+                        };
 
-                conn.tunnels.insert(tid, tunnel);
-                Ok(())
+                        Err(Error::TunnelError(e))
+                    }
+
+                    Ok(local_stream) => {
+                        let mut tunnel = Tunnel::new(tid);
+                        tunnel.listen(local_stream, conn.clone()).await;
+                        conn.tunnels.insert(tid, tunnel);
+                        Ok(())
+                    }
+                }
             }
 
             XrtcMessage::TcpClose {
@@ -194,12 +211,27 @@ impl XrtcServer {
         Ok(())
     }
 
-    pub async fn send_message(&self, cid: ConnectionId, msg: XrtcMessage) -> Result<()> {
-        self.connections
+    pub async fn dial(
+        &self,
+        cid: ConnectionId,
+        remote_addr: SocketAddr,
+        local_stream: TcpStream,
+    ) -> Result<()> {
+        let conn = self
+            .connections
             .get(&cid)
-            .ok_or(Error::ConnectionNotFound)?
-            .send_message(msg)
-            .await
+            .ok_or(Error::ConnectionNotFound)?;
+
+        let tid = uuid::Uuid::new_v4();
+        let mut tunnel = Tunnel::new(tid);
+        tunnel.listen(local_stream, conn.clone()).await;
+
+        conn.tunnels.insert(tid, tunnel);
+        conn.send_message(XrtcMessage::TcpDial {
+            tid,
+            addr: remote_addr,
+        })
+        .await
     }
 }
 

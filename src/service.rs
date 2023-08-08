@@ -22,9 +22,9 @@ struct ServiceState {
 }
 
 #[derive(Deserialize, Serialize)]
-struct Connect {
-    cid: ConnectionId,
-    endpoint: String,
+pub struct Connect {
+    pub cid: ConnectionId,
+    pub endpoint: String,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -81,12 +81,11 @@ impl IntoResponse for ServiceError {
     }
 }
 
-pub async fn run_http_service(service_address: &str, xrtc_server: Arc<XrtcServer>) {
+pub async fn run_http_service(xrtc_server: Arc<XrtcServer>, service_address: &str) {
     let state = ServiceState { xrtc_server };
     let router = Router::new()
         .route("/connect", post(connect))
         .route("/answer_offer", post(answer_offer))
-        .route("/send_message", post(send_message))
         .with_state(state);
     Server::bind(&service_address.parse().unwrap())
         .serve(router.into_make_service())
@@ -151,16 +150,4 @@ async fn answer_offer(
     };
 
     Ok(Json(response))
-}
-
-async fn send_message(
-    State(state): State<ServiceState>,
-    Json(payload): Json<SendMessage>,
-) -> Result<(), ServiceError> {
-    state
-        .xrtc_server
-        .send_message(payload.cid, payload.message)
-        .await?;
-
-    Ok(())
 }
