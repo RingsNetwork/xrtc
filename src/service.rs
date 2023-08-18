@@ -11,15 +11,13 @@ use axum::Server;
 use serde::Deserialize;
 use serde::Serialize;
 
+use crate::backend::XrtcBackend;
+use crate::callback::XrtcMessage;
 use crate::error::Error;
 use crate::ConnectionId;
-use crate::XrtcMessage;
 use crate::XrtcServer;
 
-#[derive(Clone)]
-struct ServiceState {
-    xrtc_server: Arc<XrtcServer>,
-}
+type ServiceState<TBackend> = Arc<XrtcServer<TBackend>>;
 
 #[derive(Deserialize, Serialize)]
 pub struct Connect {
@@ -47,7 +45,7 @@ struct ErrorMessage {
 #[derive(thiserror::Error, Debug)]
 enum ServiceError {
     #[error("Xrtc server error: {0}")]
-    XrtcServer(#[from] Error),
+    Transport(#[from] Error),
     #[error("Peer request error: {0:?}")]
     PeerRequestError(#[from] reqwest::Error),
     #[error("Peer response error: {0:?}")]
@@ -61,7 +59,7 @@ enum ServiceError {
 impl IntoResponse for ServiceError {
     fn into_response(self) -> Response {
         let (status, error_message) = match self {
-            ServiceError::XrtcServer(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+            ServiceError::Transport(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
             ServiceError::PeerRequestError(e) => (StatusCode::BAD_REQUEST, e.to_string()),
             ServiceError::PeerResponseError(e) => (
                 StatusCode::BAD_REQUEST,
@@ -81,8 +79,13 @@ impl IntoResponse for ServiceError {
     }
 }
 
-pub async fn run_http_service(xrtc_server: Arc<XrtcServer>, service_address: &str) {
-    let state = ServiceState { xrtc_server };
+pub async fn run_http_service<TBackend>(
+    xrtc_server: Arc<XrtcServer<TBackend>>,
+    service_address: &str,
+) where
+    TBackend: XrtcBackend + Sync + Send + 'static,
+{
+    let state = xrtc_server.clone();
     let router = Router::new()
         .route("/connect", post(connect))
         .route("/answer_offer", post(answer_offer))
@@ -93,16 +96,18 @@ pub async fn run_http_service(xrtc_server: Arc<XrtcServer>, service_address: &st
         .unwrap();
 }
 
-async fn connect(
-    State(state): State<ServiceState>,
+async fn connect<TBackend>(
+    State(state): State<ServiceState<TBackend>>,
     Json(payload): Json<Connect>,
-) -> Result<(), ServiceError> {
-    state
-        .xrtc_server
-        .new_connection(payload.cid.clone())
-        .await?;
-    let Some(conn) = state.xrtc_server.connections.get(&payload.cid) else {
-        return Err(ServiceError::ConnectionNotFound{conn_id: payload.cid})
+) -> Result<(), ServiceError>
+where
+    TBackend: XrtcBackend + Sync + Send + 'static,
+{
+    state.new_connection(payload.cid.clone()).await?;
+    let Some(conn) = state.transport.get_connection(&payload.cid) else {
+        return Err(ServiceError::ConnectionNotFound {
+            conn_id: payload.cid,
+        });
     };
 
     let offer = conn.webrtc_create_offer().await?;
@@ -129,18 +134,20 @@ async fn connect(
     Ok(())
 }
 
-async fn answer_offer(
-    State(state): State<ServiceState>,
+async fn answer_offer<TBackend>(
+    State(state): State<ServiceState<TBackend>>,
     Json(payload): Json<Handshake>,
-) -> Result<Json<Handshake>, ServiceError> {
+) -> Result<Json<Handshake>, ServiceError>
+where
+    TBackend: XrtcBackend + Sync + Send + 'static,
+{
     let offer = serde_json::from_str(&payload.sdp)?;
 
-    state
-        .xrtc_server
-        .new_connection(payload.cid.clone())
-        .await?;
-    let Some(conn) = state.xrtc_server.connections.get(&payload.cid) else {
-        return Err(ServiceError::ConnectionNotFound{conn_id: payload.cid})
+    state.new_connection(payload.cid.clone()).await?;
+    let Some(conn) = state.transport.get_connection(&payload.cid) else {
+        return Err(ServiceError::ConnectionNotFound {
+            conn_id: payload.cid,
+        });
     };
 
     let answer = conn.webrtc_answer_offer(offer).await?;
