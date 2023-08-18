@@ -83,19 +83,15 @@ impl TunnelListener {
         let (mut local_read, mut local_write) = self.local_stream.split();
 
         let listen_local = async {
-            let mut defeat = TunnelDefeat::None;
-
             loop {
                 let mut buf = [0u8; 30000];
 
                 match local_read.read(&mut buf).await {
                     Err(e) => {
-                        defeat = e.kind().into();
-                        break;
+                        break e.kind().into();
                     }
                     Ok(n) if n == 0 => {
-                        defeat = TunnelDefeat::ConnectionClosed;
-                        break;
+                        break TunnelDefeat::ConnectionClosed;
                     }
                     Ok(n) => {
                         let body = Bytes::copy_from_slice(&buf[..n]);
@@ -106,36 +102,27 @@ impl TunnelListener {
 
                         let Ok(xrtc_message) = message.try_into() else {
                             tracing::error!("Serialize ProxyMessage::TcpPackage failed");
-                            defeat = TunnelDefeat::SerializationFailed;
-                            break;
+                            break TunnelDefeat::SerializationFailed;
                         };
 
                         if let Err(e) = self.connection.send_message(xrtc_message).await {
                             tracing::error!("Send TcpPackage message failed: {e:?}");
-                            defeat = TunnelDefeat::WebrtcDatachannelSendFailed;
-                            break;
+                            break TunnelDefeat::WebrtcDatachannelSendFailed;
                         }
                     }
                 }
             }
-
-            defeat
         };
 
         let listen_remote = async {
-            let mut defeat = TunnelDefeat::None;
-
             loop {
                 if let Some(body) = self.remote_stream_rx.recv().await {
                     if let Err(e) = local_write.write_all(&body).await {
                         tracing::error!("Write to local stream failed: {e:?}");
-                        defeat = e.kind().into();
-                        break;
+                        break e.kind().into();
                     }
                 }
             }
-
-            defeat
         };
 
         tokio::select! {
