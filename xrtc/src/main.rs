@@ -5,10 +5,10 @@ use clap::Args;
 use clap::Parser;
 use clap::Subcommand;
 use tokio::net::TcpListener;
-use xrtc::protocols::proxy::XrtcProxy;
-use xrtc::rtc::connection::ConnectionId;
 use xrtc::service::run_http_service;
-use xrtc::XrtcServer;
+use xrtc_proxy::Proxy;
+use xrtc_swarm::Swarm;
+use xrtc_transport::Transport;
 
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
@@ -60,14 +60,16 @@ async fn main() {
 }
 
 async fn run_server(args: ServerArgs) {
-    let backend = XrtcProxy::new();
-    let server = Arc::new(XrtcServer::new(args.ice_servers, backend));
-    run_http_service(server.clone(), &args.service_address).await;
+    let transport = Transport::new(args.ice_servers);
+    let backend = Proxy::new(transport.clone());
+    let swarm = Arc::new(Swarm::new(transport, backend));
+    run_http_service(swarm, &args.service_address).await;
 }
 
 async fn run_client(args: ClientArgs) {
-    let backend = XrtcProxy::new();
-    let server = Arc::new(XrtcServer::new(args.ice_servers, backend));
+    let transport = Transport::new(args.ice_servers);
+    let backend = Proxy::new(transport.clone());
+    let swarm = Arc::new(Swarm::new(transport, backend));
     let cid = uuid::Uuid::new_v4().to_string();
 
     let proxy_listen_address = args
@@ -94,20 +96,15 @@ async fn run_client(args: ClientArgs) {
     };
 
     futures::join!(
-        run_http_service(server.clone(), &args.service_address),
-        run_proxy_listener(
-            server.clone(),
-            cid.clone(),
-            proxy_listen_address,
-            server_target_address
-        ),
+        run_http_service(swarm.clone(), &args.service_address),
+        run_proxy_listener(swarm, &cid, proxy_listen_address, server_target_address),
         wait_then_connect,
     );
 }
 
 async fn run_proxy_listener(
-    xrtc_server: Arc<XrtcServer<XrtcProxy>>,
-    cid: ConnectionId,
+    swarm: Arc<Swarm<Transport, Proxy<Transport>>>,
+    cid: &str,
     proxy_listen_address: SocketAddr,
     server_target_address: SocketAddr,
 ) {
@@ -121,9 +118,9 @@ async fn run_proxy_listener(
             .await
             .expect("Failed to accept connection");
 
-        xrtc_server
+        swarm
             .backend()
-            .dial(cid.to_string(), server_target_address, socket)
+            .dial(cid, server_target_address, socket)
             .await
             .expect("Failed to dial");
     }

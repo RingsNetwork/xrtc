@@ -1,16 +1,14 @@
-use std::sync::Arc;
-
 use bytes::Bytes;
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use uuid::Uuid;
+use xrtc_core::message::XrtcMessage;
+use xrtc_core::transport::SharedConnection;
 
-use crate::callback::XrtcMessage;
 use crate::error::TunnelDefeat;
-use crate::protocols::proxy::ProxyMessage;
-use crate::rtc::connection::XrtcConnection;
+use crate::message::ProxyMessage;
 
 pub type TunnelId = Uuid;
 
@@ -20,12 +18,14 @@ pub(crate) struct Tunnel {
     listener: Option<tokio::task::JoinHandle<()>>,
 }
 
-pub(crate) struct TunnelListener {
+pub(crate) struct TunnelListener<C>
+where C: SharedConnection
+{
     tid: TunnelId,
     local_stream: TcpStream,
     remote_stream_tx: mpsc::Sender<Bytes>,
     remote_stream_rx: mpsc::Receiver<Bytes>,
-    connection: Arc<XrtcConnection>,
+    connection: C,
 }
 
 impl Drop for Tunnel {
@@ -53,12 +53,13 @@ impl Tunnel {
         }
     }
 
-    pub async fn listen(&mut self, local_stream: TcpStream, connection: Arc<XrtcConnection>) {
+    pub async fn listen<C>(&mut self, local_stream: TcpStream, connection: C)
+    where C: SharedConnection {
         if self.listener.is_some() {
             return;
         }
 
-        let mut listener = TunnelListener::new(self.tid, local_stream, connection.clone()).await;
+        let mut listener = TunnelListener::new(self.tid, local_stream, connection).await;
         let remote_stream_tx = listener.remote_stream_tx.clone();
         let listener_handler = tokio::spawn(Box::pin(async move { listener.listen().await }));
 
@@ -67,8 +68,10 @@ impl Tunnel {
     }
 }
 
-impl TunnelListener {
-    async fn new(tid: TunnelId, local_stream: TcpStream, connection: Arc<XrtcConnection>) -> Self {
+impl<C> TunnelListener<C>
+where C: SharedConnection
+{
+    async fn new(tid: TunnelId, local_stream: TcpStream, connection: C) -> Self {
         let (remote_stream_tx, remote_stream_rx) = mpsc::channel(1024);
         Self {
             tid,

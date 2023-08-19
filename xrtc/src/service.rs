@@ -10,30 +10,29 @@ use axum::Router;
 use axum::Server;
 use serde::Deserialize;
 use serde::Serialize;
+use xrtc_core::message::XrtcMessage;
+use xrtc_core::transport::SharedConnection;
+use xrtc_core::transport::SharedTransport;
+use xrtc_swarm::Backend;
+use xrtc_swarm::Swarm;
 
-use crate::backend::XrtcBackend;
-use crate::callback::XrtcMessage;
-use crate::error::Error;
-use crate::ConnectionId;
-use crate::XrtcServer;
-
-type ServiceState<TBackend> = Arc<XrtcServer<TBackend>>;
+type ServiceState<T, B> = Arc<Swarm<T, B>>;
 
 #[derive(Deserialize, Serialize)]
 pub struct Connect {
-    pub cid: ConnectionId,
+    pub cid: String,
     pub endpoint: String,
 }
 
 #[derive(Deserialize, Serialize)]
 struct Handshake {
-    cid: ConnectionId,
+    cid: String,
     sdp: String,
 }
 
 #[derive(Deserialize, Serialize)]
 struct SendMessage {
-    cid: ConnectionId,
+    cid: String,
     message: XrtcMessage,
 }
 
@@ -44,22 +43,29 @@ struct ErrorMessage {
 
 #[derive(thiserror::Error, Debug)]
 enum ServiceError {
-    #[error("Xrtc server error: {0}")]
-    Transport(#[from] Error),
+    #[error("Xrtc swarm error: {0}")]
+    Swarm(#[from] Box<dyn std::error::Error + Send + Sync>),
     #[error("Peer request error: {0:?}")]
     PeerRequestError(#[from] reqwest::Error),
     #[error("Peer response error: {0:?}")]
     PeerResponseError(ErrorMessage),
     #[error("Serde json error: {0}")]
     SerdeJson(#[from] serde_json::Error),
-    #[error("Connection not found: {conn_id}")]
-    ConnectionNotFound { conn_id: String },
+    #[error("Connection not found: {cid}")]
+    ConnectionNotFound { cid: String },
+}
+
+impl ServiceError {
+    fn swarm_error<E>(e: E) -> Self
+    where E: std::error::Error + Send + Sync + 'static {
+        ServiceError::Swarm(Box::new(e))
+    }
 }
 
 impl IntoResponse for ServiceError {
     fn into_response(self) -> Response {
         let (status, error_message) = match self {
-            ServiceError::Transport(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+            ServiceError::Swarm(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
             ServiceError::PeerRequestError(e) => (StatusCode::BAD_REQUEST, e.to_string()),
             ServiceError::PeerResponseError(e) => (
                 StatusCode::BAD_REQUEST,
@@ -79,11 +85,10 @@ impl IntoResponse for ServiceError {
     }
 }
 
-pub async fn run_http_service<TBackend>(
-    xrtc_server: Arc<XrtcServer<TBackend>>,
-    service_address: &str,
-) where
-    TBackend: XrtcBackend + Sync + Send + 'static,
+pub async fn run_http_service<T, B>(xrtc_server: Arc<Swarm<T, B>>, service_address: &str)
+where
+    T: SharedTransport,
+    B: Backend + Send + Sync + 'static,
 {
     let state = xrtc_server.clone();
     let router = Router::new()
@@ -96,21 +101,27 @@ pub async fn run_http_service<TBackend>(
         .unwrap();
 }
 
-async fn connect<TBackend>(
-    State(state): State<ServiceState<TBackend>>,
+async fn connect<T, B>(
+    State(state): State<ServiceState<T, B>>,
     Json(payload): Json<Connect>,
 ) -> Result<(), ServiceError>
 where
-    TBackend: XrtcBackend + Sync + Send + 'static,
+    T: SharedTransport,
+    B: Backend,
 {
-    state.new_connection(payload.cid.clone()).await?;
-    let Some(conn) = state.transport.get_connection(&payload.cid) else {
-        return Err(ServiceError::ConnectionNotFound {
-            conn_id: payload.cid,
-        });
+    state
+        .new_connection(&payload.cid)
+        .await
+        .map_err(ServiceError::swarm_error)?;
+
+    let Some(conn) = state.get_connection(&payload.cid) else {
+        return Err(ServiceError::ConnectionNotFound { cid: payload.cid });
     };
 
-    let offer = conn.webrtc_create_offer().await?;
+    let offer = conn
+        .webrtc_create_offer()
+        .await
+        .map_err(ServiceError::swarm_error)?;
 
     let handshake_resp = reqwest::Client::new()
         .post(format!("{}/answer_offer", payload.endpoint))
@@ -128,29 +139,37 @@ where
 
     let handshake = handshake_resp.json::<Handshake>().await?;
 
-    let answer = serde_json::from_str(&handshake.sdp)?;
-    conn.webrtc_accept_answer(answer).await?;
+    let answer = serde_json::from_str(&handshake.sdp).map_err(ServiceError::swarm_error)?;
+    conn.webrtc_accept_answer(answer)
+        .await
+        .map_err(ServiceError::swarm_error)?;
 
     Ok(())
 }
 
-async fn answer_offer<TBackend>(
-    State(state): State<ServiceState<TBackend>>,
+async fn answer_offer<T, B>(
+    State(state): State<ServiceState<T, B>>,
     Json(payload): Json<Handshake>,
 ) -> Result<Json<Handshake>, ServiceError>
 where
-    TBackend: XrtcBackend + Sync + Send + 'static,
+    T: SharedTransport,
+    B: Backend + Send + Sync,
 {
     let offer = serde_json::from_str(&payload.sdp)?;
 
-    state.new_connection(payload.cid.clone()).await?;
-    let Some(conn) = state.transport.get_connection(&payload.cid) else {
-        return Err(ServiceError::ConnectionNotFound {
-            conn_id: payload.cid,
-        });
+    state
+        .new_connection(&payload.cid)
+        .await
+        .map_err(ServiceError::swarm_error)?;
+
+    let Some(conn) = state.get_connection(&payload.cid) else {
+        return Err(ServiceError::ConnectionNotFound { cid: payload.cid });
     };
 
-    let answer = conn.webrtc_answer_offer(offer).await?;
+    let answer = conn
+        .webrtc_answer_offer(offer)
+        .await
+        .map_err(ServiceError::swarm_error)?;
     let response = Handshake {
         cid: payload.cid.clone(),
         sdp: serde_json::to_string(&answer)?,

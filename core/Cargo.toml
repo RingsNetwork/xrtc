@@ -1,0 +1,8 @@
+[package]
+name = "xrtc-core"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+async-trait = "0.1.73"
+serde = { version = "1.0.183", features = ["derive"] }
