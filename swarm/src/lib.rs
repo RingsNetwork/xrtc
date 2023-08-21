@@ -32,16 +32,8 @@ where
         }
     }
 
-    pub fn transport(&self) -> T {
-        self.transport.clone()
-    }
-
     pub fn backend(&self) -> &B {
         &self.backend
-    }
-
-    pub fn backend_mut(&mut self) -> &mut B {
-        &mut self.backend
     }
 
     pub async fn new_connection(&self, cid: &str) -> Result<(), T::Error> {
