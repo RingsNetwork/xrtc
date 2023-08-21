@@ -3278,6 +3278,7 @@ dependencies = [
  "serde",
  "thiserror",
  "tokio",
+ "tokio-util",
  "tracing",
  "uuid",
  "xrtc-core",

@@ -19,7 +19,7 @@ where CE: std::error::Error + Send + Sync + 'static
         match bincode::deserialize(msg) {
             Ok(m) => self.handle_message(cid, &m).await,
             Err(e) => {
-                tracing::error!("Deserialize DataChannelMessage failed: {:?}", e);
+                tracing::error!("Deserialize DataChannelMessage failed: {e:?}");
             }
         };
     }

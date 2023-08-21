@@ -3,6 +3,7 @@ use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 use xrtc_core::message::XrtcMessage;
 use xrtc_core::transport::SharedConnection;
@@ -15,6 +16,7 @@ pub type TunnelId = Uuid;
 pub(crate) struct Tunnel {
     tid: TunnelId,
     remote_stream_tx: Option<mpsc::Sender<Bytes>>,
+    listener_cancel_token: Option<CancellationToken>,
     listener: Option<tokio::task::JoinHandle<()>>,
 }
 
@@ -26,12 +28,21 @@ where C: SharedConnection
     remote_stream_tx: mpsc::Sender<Bytes>,
     remote_stream_rx: mpsc::Receiver<Bytes>,
     connection: C,
+    cancel_token: CancellationToken,
 }
 
 impl Drop for Tunnel {
     fn drop(&mut self) {
+        if let Some(cancel_token) = self.listener_cancel_token.take() {
+            cancel_token.cancel();
+        }
+
+        // Wait a time for listener to exit. Then abort it.
         if let Some(listener) = self.listener.take() {
-            listener.abort();
+            tokio::spawn(async move {
+                tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+                listener.abort();
+            });
         }
     }
 }
@@ -42,6 +53,7 @@ impl Tunnel {
             tid,
             remote_stream_tx: None,
             listener: None,
+            listener_cancel_token: None,
         }
     }
 
@@ -60,11 +72,13 @@ impl Tunnel {
         }
 
         let mut listener = TunnelListener::new(self.tid, local_stream, connection).await;
+        let listener_cancel_token = listener.cancel_token();
         let remote_stream_tx = listener.remote_stream_tx.clone();
         let listener_handler = tokio::spawn(Box::pin(async move { listener.listen().await }));
 
         self.remote_stream_tx = Some(remote_stream_tx);
         self.listener = Some(listener_handler);
+        self.listener_cancel_token = Some(listener_cancel_token);
     }
 }
 
@@ -79,7 +93,12 @@ where C: SharedConnection
             remote_stream_tx,
             remote_stream_rx,
             connection,
+            cancel_token: CancellationToken::new(),
         }
+    }
+
+    fn cancel_token(&self) -> CancellationToken {
+        self.cancel_token.clone()
     }
 
     async fn listen(&mut self) {
@@ -87,8 +106,11 @@ where C: SharedConnection
 
         let listen_local = async {
             loop {
-                let mut buf = [0u8; 30000];
+                if self.cancel_token.is_cancelled() {
+                    break TunnelDefeat::ConnectionClosed;
+                }
 
+                let mut buf = [0u8; 30000];
                 match local_read.read(&mut buf).await {
                     Err(e) => {
                         break e.kind().into();
@@ -119,6 +141,10 @@ where C: SharedConnection
 
         let listen_remote = async {
             loop {
+                if self.cancel_token.is_cancelled() {
+                    break TunnelDefeat::ConnectionClosed;
+                }
+
                 if let Some(body) = self.remote_stream_rx.recv().await {
                     if let Err(e) = local_write.write_all(&body).await {
                         tracing::error!("Write to local stream failed: {e:?}");

@@ -77,7 +77,6 @@ impl SharedTransport for Transport {
             let inner_cb = inner_cb.clone();
 
             Box::pin(async move {
-                // Register text message handling
                 d.on_message(Box::new(move |msg: DataChannelMessage| {
                     tracing::debug!("Received DataChannelMessage from {conn_id}: {msg:?}");
 

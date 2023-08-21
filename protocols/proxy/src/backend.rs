@@ -24,6 +24,7 @@ where T: SharedTransport
 
     async fn on_message(&self, cid: &str, msg: &[u8]) -> Result<(), Error> {
         let msg = bincode::deserialize::<ProxyMessage>(msg)?;
+        tracing::debug!("Received proxy message: {msg:?}");
 
         match self.handle_message(cid, &msg).await {
             Ok(_) => Ok(()),
